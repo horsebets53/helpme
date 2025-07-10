@@ -171,7 +171,7 @@ fn shors_algorithm(n: i64) {
         let n_bits = (n as f64).log2().ceil() as u32;
         let q_qubits = 2 * n_bits;
 
-        const MAX_SIMULATED_QUBITS: u32 = 128;  // change it as you will, probably the best option is 24 qubits(16GB ram, 2^24)
+        const MAX_SIMULATED_QUBITS: u32 = 24;  // change it as you will, probably the best option is 24 qubits(16GB ram, 2^24)
         if q_qubits > MAX_SIMULATED_QUBITS {
             println!("Error: The number {} is too large to simulate.", n);
             return;
