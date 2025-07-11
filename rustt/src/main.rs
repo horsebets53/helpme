@@ -91,16 +91,19 @@ fn continued_fractions(x: f64, n: i64) -> i64 {
 
 
 
-fn hadamard(state: &mut QuantumState, qubit_idx: usize) {
+fn hadamard(state: &mut QuantumState, qubit: usize) {
     let n_qubits = (state.len() as f64).log2() as usize;
-    let k = n_qubits - qubit_idx;
-    let block_size = 1 << (k - 1);
-    let num_blocks = 1 << qubit_idx;
+    // Эта реализация применяет вентиль Адамара к указанному `qubit` (0-индексация от младшего бита, LSB).
+    // Исходная версия использовала неконсистентную индексацию, что приводило к ошибке в IQFT.
+    let stride = 1 << (qubit + 1);
+    let block_size = 1 << qubit;
     let sqrt2_inv = 1.0 / 2.0f64.sqrt();
 
-    for i in 0..num_blocks {
+    // Итерация по блокам состояний, которые затрагивает вентиль.
+    for i in 0..(1 << (n_qubits - 1 - qubit)) {
+        let block_start = i * stride;
         for j in 0..block_size {
-            let idx1 = i * 2 * block_size + j;
+            let idx1 = block_start + j;
             let idx2 = idx1 + block_size;
             let temp = state[idx1];
             state[idx1] = (state[idx1] + state[idx2]) * sqrt2_inv;
@@ -112,6 +115,7 @@ fn hadamard(state: &mut QuantumState, qubit_idx: usize) {
 fn iqft(state: &mut QuantumState) {
     let n = (state.len() as f64).log2() as usize;
 
+    // Bit reversal
     for i in 0..state.len() {
         let reversed_i = i.reverse_bits() >> (usize::BITS as usize - n);
         if i < reversed_i {
@@ -120,16 +124,37 @@ fn iqft(state: &mut QuantumState) {
     }
 
     for i in 0..n {
-        hadamard(state, i);
         for j in 0..i {
             let angle = -2.0 * PI / (1 << (i - j + 1)) as f64;
             let phase_shift = Complex::new(angle.cos(), angle.sin());
-            for k in 0..state.len() {
-                if (k >> i) & 1 != 0 && (k >> j) & 1 != 0 {
-                    state[k] *= phase_shift;
+
+            // Оптимизация управляемого фазового сдвига.
+            // Исходный цикл for k in 0..state.len() итерировал по всему вектору состояний (2^n элементов)
+            // для каждой пары кубитов (i, j), что крайне неэффективно (сложность O(n^2 * 2^n)).
+            //
+            // Новый код напрямую вычисляет индексы состояний `k`, где управляющий кубит `j` и целевой кубит `i`
+            // равны 1, и применяет сдвиг только к ним. Это сокращает сложность этой части до O(n^2 * 2^(n-2)),
+            // что в 4 раза быстрее для каждого вентиля и значительно ускоряет всю симуляцию.
+            let target = i;
+            let control = j;
+
+            let target_bit = 1 << target;
+            let control_bit = 1 << control;
+            let high_stride = 1 << (target + 1);
+            let mid_stride = 1 << (control + 1);
+
+            for high_part in 0..(1 << (n - target - 1)) {
+                let high_offset = high_part * high_stride;
+                for mid_part in 0..(1 << (target - control - 1)) {
+                    let mid_offset = mid_part * mid_stride;
+                    for low_part in 0..(1 << control) {
+                        let index = high_offset + mid_offset + low_part + target_bit + control_bit;
+                        state[index] *= phase_shift;
+                    }
                 }
             }
         }
+        hadamard(state, i); // Адамар ПОСЛЕ фазовых сдвигов КРИТИЧЕСКАЯ ОШИБКА была
     }
 }
 
@@ -171,7 +196,7 @@ fn shors_algorithm(n: i64) {
         let n_bits = (n as f64).log2().ceil() as u32;
         let q_qubits = 2 * n_bits;
 
-        const MAX_SIMULATED_QUBITS: u32 = 24;  // change it as you will, probably the best option is 24 qubits(16GB ram, 2^24)
+        const MAX_SIMULATED_QUBITS: u32 = 128;
         if q_qubits > MAX_SIMULATED_QUBITS {
             println!("Error: The number {} is too large to simulate.", n);
             return;
