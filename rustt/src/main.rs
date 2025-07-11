@@ -1,271 +1,470 @@
-// Для работы этого кода нужны зависимости:
+// Оптимизированная версия алгоритма Шора
 // num-complex = "0.4"
 // rand = "0.8"
+// rayon = "1.7" // для параллельных вычислений
 
 use num_complex::Complex;
+use rand::seq::IteratorRandom;
 use rand::Rng;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::io;
-
-
-
+use std::env;
 
 type QuantumState = Vec<Complex<f64>>;
 
-
-
-
+/// Оптимизированное быстрое возведение в степень по модулю
 fn power(base: i64, exp: i64, modulus: i64) -> i64 {
-    let mut res = 1;
+    if modulus == 0 {
+        panic!("Modulus cannot be zero");
+    }
+    if modulus == 1 {
+        return 0;
+    }
+    
+    let mut res = 1i64;
     let mut base = base % modulus;
     let mut exp = exp;
     while exp > 0 {
-        if exp % 2 == 1 {
+        if exp & 1 == 1 {  // Используем битовую операцию вместо % 2
             res = (res * base) % modulus;
         }
         base = (base * base) % modulus;
-        exp /= 2;
+        exp >>= 1;  // Битовый сдвиг вместо деления на 2
     }
     res
 }
 
 
-
 // наибольний общий делитель
+/// Улучшенный алгоритм Евклида с swap
 fn gcd(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    
     while b != 0 {
-        let temp = a % b;
-        a = b;
-        b = temp;
+        std::mem::swap(&mut a, &mut b);
+        b %= a;
     }
-    a.abs()
+    a
 }
 
-
-
-
-fn is_prime(n: i64, k: i32) -> bool {
-    if n <= 1 || n == 4 { return false; }
-    if n <= 3 { return true; }
-    if n % 2 == 0 { return false; }
-
+/// Улучшенный тест простоты с детерминистическими проверками
+fn is_prime(n: i64, k: u32) -> bool {
+    if n <= 1 {
+        return false;
+    }
+    if n <= 3 {
+        return true;
+    }
+    if n % 2 == 0 || n % 3 == 0 {
+        return false;
+    }
+    
+    // Проверка малых делителей до sqrt(n)
+    if n < 1000 {
+        let sqrt_n = (n as f64).sqrt() as i64;
+        for i in (5..=sqrt_n).step_by(6) {
+            if n % i == 0 || n % (i + 2) == 0 {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    // Тест Миллера-Рабина для больших чисел
     let mut d = n - 1;
+    let mut r = 0;
     while d % 2 == 0 {
         d /= 2;
+        r += 1;
     }
 
     let mut rng = rand::thread_rng();
-    for _ in 0..k {
-        let a = rng.gen_range(2..n - 2);
+    'witness_loop: for _ in 0..k {
+        let a = rng.gen_range(2..n - 1);
         let mut x = power(a, d, n);
 
         if x == 1 || x == n - 1 {
             continue;
         }
 
-        let mut temp_d = d;
-        while temp_d != n - 1 {
-            x = (x * x) % n;
-            if x == 1 { return false; }
-            if x == n - 1 { break; }
-            temp_d *= 2;
+        for _ in 0..(r - 1) {
+            x = power(x, 2, n);
+            if x == 1 {
+                return false;
+            }
+            if x == n - 1 {
+                continue 'witness_loop;
+            }
         }
-        if x != n - 1 { return false; }
+        return false;
     }
     true
 }
 
-
-
-
-fn continued_fractions(x: f64, n: i64) -> i64 {
-    if (x - x.floor()).abs() < 1.0 / (2.0 * n as f64) {
-        return x.floor() as i64;
-    }
-    if x.abs() < 1.0e-9 {
-        return 0;
-    }
-    x.floor() as i64 + continued_fractions(1.0 / (x - x.floor()), n)
-}
-
-
-
+/// Оптимизированная и распараллеленная реализация вентиля Адамара.
+/// Эта версия исправляет логическую ошибку в предложенной "упрощённой" реализации,
+/// сохраняя при этом корректный блочный подход, который правильно работает для любого кубита.
 fn hadamard(state: &mut QuantumState, qubit: usize) {
     let n_qubits = (state.len() as f64).log2() as usize;
-    // Эта реализация применяет вентиль Адамара к указанному `qubit` (0-индексация от младшего бита, LSB).
-    // Исходная версия использовала неконсистентную индексацию, что приводило к ошибке в IQFT.
+    if qubit >= n_qubits {
+        panic!("Qubit index out of bounds");
+    }
+
+    let sqrt2_inv = std::f64::consts::FRAC_1_SQRT_2;
     let stride = 1 << (qubit + 1);
     let block_size = 1 << qubit;
-    let sqrt2_inv = 1.0 / 2.0f64.sqrt();
 
-    // Итерация по блокам состояний, которые затрагивает вентиль.
-    for i in 0..(1 << (n_qubits - 1 - qubit)) {
-        let block_start = i * stride;
-        for j in 0..block_size {
-            let idx1 = block_start + j;
-            let idx2 = idx1 + block_size;
-            let temp = state[idx1];
-            state[idx1] = (state[idx1] + state[idx2]) * sqrt2_inv;
-            state[idx2] = (temp - state[idx2]) * sqrt2_inv;
+    // Разделяем вектор на чанки, которые можно обрабатывать параллельно.
+    // Каждый чанк соответствует одному "блоку" в классической итерации.
+    state
+        .par_chunks_mut(stride)
+        .for_each(|chunk| {
+            let (first_half, second_half) = chunk.split_at_mut(block_size);
+            for i in 0..block_size {
+                let a = first_half[i];
+                let b = second_half[i];
+                first_half[i] = (a + b) * sqrt2_inv;
+                second_half[i] = (a - b) * sqrt2_inv;
+            }
         }
-    }
+    );
 }
 
+/// Оптимизированная фазовая операция
+fn phase_shift(state: &mut QuantumState, control: usize, target: usize, angle: f64) {
+    let n_qubits = (state.len() as f64).log2() as usize;
+    if control >= n_qubits || target >= n_qubits {
+        panic!("Qubit index out of bounds");
+    }
+    
+    let phase = Complex::new(angle.cos(), angle.sin());
+    let control_mask = 1 << control;
+    let target_mask = 1 << target;
+    let combined_mask = control_mask | target_mask;
+    
+    // Распараллеливаем итерацию по изменяемым элементам вектора.
+    // `par_iter_mut()` безопасно предоставляет изменяемый доступ к каждому элементу
+    // из разных потоков, так как каждый поток работает с уникальным элементом.
+    state.par_iter_mut()
+        .enumerate()
+        .filter(|(i, _)| (i & combined_mask) == combined_mask)
+        .for_each(|(_, amp)| {
+            *amp *= phase;
+        });
+}
+
+/// Улучшенная реализация IQFT с лучшей структурой
 fn iqft(state: &mut QuantumState) {
     let n = (state.len() as f64).log2() as usize;
 
-    // Bit reversal
+    // Bit reversal - этот шаг должен быть в НАЧАЛЕ для данной реализации IQFT.
+    // Перестановка битов подготавливает состояние для каскада вентилей.
     for i in 0..state.len() {
-        let reversed_i = i.reverse_bits() >> (usize::BITS as usize - n);
-        if i < reversed_i {
-            state.swap(i, reversed_i);
+        let j = reverse_bits(i, n);
+        if i < j {
+            state.swap(i, j);
         }
     }
-
+    
+    // Основная IQFT схема
     for i in 0..n {
         for j in 0..i {
             let angle = -2.0 * PI / (1 << (i - j + 1)) as f64;
-            let phase_shift = Complex::new(angle.cos(), angle.sin());
-
-            // Оптимизация управляемого фазового сдвига.
-            // Исходный цикл for k in 0..state.len() итерировал по всему вектору состояний (2^n элементов)
-            // для каждой пары кубитов (i, j), что крайне неэффективно (сложность O(n^2 * 2^n)).
-            //
-            // Новый код напрямую вычисляет индексы состояний `k`, где управляющий кубит `j` и целевой кубит `i`
-            // равны 1, и применяет сдвиг только к ним. Это сокращает сложность этой части до O(n^2 * 2^(n-2)),
-            // что в 4 раза быстрее для каждого вентиля и значительно ускоряет всю симуляцию.
-            let target = i;
-            let control = j;
-
-            let target_bit = 1 << target;
-            let control_bit = 1 << control;
-            let high_stride = 1 << (target + 1);
-            let mid_stride = 1 << (control + 1);
-
-            for high_part in 0..(1 << (n - target - 1)) {
-                let high_offset = high_part * high_stride;
-                for mid_part in 0..(1 << (target - control - 1)) {
-                    let mid_offset = mid_part * mid_stride;
-                    for low_part in 0..(1 << control) {
-                        let index = high_offset + mid_offset + low_part + target_bit + control_bit;
-                        state[index] *= phase_shift;
-                    }
-                }
-            }
+            phase_shift(state, j, i, angle);
         }
-        hadamard(state, i); // Адамар ПОСЛЕ фазовых сдвигов КРИТИЧЕСКАЯ ОШИБКА была
+        hadamard(state, i);
     }
 }
 
-fn measure(state: &QuantumState) -> usize {
+/// Вспомогательная функция для обращения битов
+fn reverse_bits(mut n: usize, bits: usize) -> usize {
+    let mut result = 0;
+    for _ in 0..bits {
+        result = (result << 1) | (n & 1);
+        n >>= 1;
+    }
+    result
+}
+
+/// Оптимизированная функция измерения с проверкой нормализации
+fn measure(state: &QuantumState) -> Result<usize, String> {
+    // Проверка нормализации
+    let total_prob: f64 = state.iter().map(|amp| amp.norm_sqr()).sum();
+    if (total_prob - 1.0).abs() > 1e-10 {
+        return Err(format!("State is not normalized: total probability = {}", total_prob));
+    }
+    
     let mut rng = rand::thread_rng();
     let r: f64 = rng.gen();
     let mut cumulative_prob = 0.0;
+    
     for (i, amplitude) in state.iter().enumerate() {
         cumulative_prob += amplitude.norm_sqr();
         if r < cumulative_prob {
-            return i;
+            return Ok(i);
         }
     }
-    state.len() - 1
+    
+    Ok(state.len() - 1)
 }
 
+/// Улучшенный алгоритм непрерывных дробей
+fn get_continued_fraction_denominators(num: i64, den: i64, max_val: i64) -> Vec<i64> {
+    let mut results = Vec::new();
+    let mut a = num;
+    let mut b = den;
+    let mut q_prev = 0i64;
+    let mut q_curr = 1i64;
 
-fn shors_algorithm(n: i64) {
-    if is_prime(n, 5) {
-        println!("{} is prime.", n);
-        return;
+    while b != 0 {
+        let quotient = a / b;
+        let remainder = a % b;
+        
+        // Проверка на переполнение
+        if let Some(next_q) = quotient.checked_mul(q_curr) {
+            if let Some(q_next) = next_q.checked_add(q_prev) {
+                if q_next <= max_val {
+                    results.push(q_next);
+                    a = b;
+                    b = remainder;
+                    q_prev = q_curr;
+                    q_curr = q_next;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    
+    results
+}
+
+/// Основной алгоритм Шора с улучшениями
+///
+/// # Примечание о симуляции
+///
+/// Эта реализация использует "классический оракул" для ускорения. Вместо того,
+/// чтобы симулировать сложный квантовый оператор модульного возведения в степень
+/// (U_f|x⟩|0⟩ = |x⟩|a^x mod n⟩), она сначала классически вычисляет все значения
+/// a^x mod n и группирует их в HashMap. Затем она "симулирует" измерение,
+/// выбирая случайный результат, и искусственно создает конечное квантовое состояние.
+///
+/// Это распространенное и эффективное упрощение, но оно принципиально отличается
+/// от того, как работает настоящий квантовый компьютер, который создает единую
+/// запутанную суперпозицию всех состояний за одну операцию.
+///
+fn shors_algorithm(n: i64, force_quantum: bool) -> Result<i64, String> {
+    if n <= 1 {
+        return Err("Число должно быть больше 1".to_string());
+    }
+    
+    if is_prime(n, 10) {
+        return Err(format!("Число {} - простое", n));
     }
 
     if n % 2 == 0 {
-        println!("Factor found: 2");
-        return;
+        return Ok(2);
+    }
+    
+    if !force_quantum {
+        println!("Выполняются быстрые классические проверки...");
+        // Проверка на точные степени
+        for k in 2..((n as f64).log2() as i64 + 1) {
+            let root = (n as f64).powf(1.0 / k as f64).round() as i64;
+            if power(root, k, i64::MAX) == n {
+                return Ok(root);
+            }
+        }
+
+        // Улучшенная классическая проверка: пробное деление на малые простые числа.
+        let limit = (n as f64).sqrt() as i64;
+        for i in (3..=limit.min(1000)).step_by(2) {
+            if n % i == 0 {
+                return Ok(i);
+            }
+        }
+    } else {
+        println!("Классические проверки пропущены. Принудительный запуск квантовой симуляции.");
+    }
+
+    // --- Квантовая часть ---
+    // Теперь, когда все быстрые классические проверки провалились,
+    // проверяем, можем ли мы вообще запустить квантовую симуляцию.
+    let n_bits = (n as f64).log2().ceil() as u32;
+    let q_qubits = 2 * n_bits;
+    const MAX_SIMULATED_QUBITS: u32 = 26;
+    if q_qubits > MAX_SIMULATED_QUBITS {
+        return Err(format!(
+            "Число {} требует {} кубитов для симуляции, что превышает лимит в {}. Классические проверки не нашли множителей.",
+            n, q_qubits, MAX_SIMULATED_QUBITS
+        ));
     }
 
     let mut rng = rand::thread_rng();
+    let max_attempts = 100;
 
-    loop {
+    'attempt_loop: for attempt in 0..max_attempts {
         let a = rng.gen_range(2..n);
         let common_divisor = gcd(a, n);
         if common_divisor > 1 {
-            println!("Factor found classically: {}", common_divisor);
-            return;
-        }
-
-        let n_bits = (n as f64).log2().ceil() as u32;
-        let q_qubits = 2 * n_bits;
-
-        const MAX_SIMULATED_QUBITS: u32 = 128;
-        if q_qubits > MAX_SIMULATED_QUBITS {
-            println!("Error: The number {} is too large to simulate.", n);
-            return;
+            return Ok(common_divisor);
         }
 
         let q_size = 1 << q_qubits;
+        println!("Attempt {}: Using {} qubits, a = {}", attempt + 1, q_qubits, a);
 
-        let mut results_map: HashMap<i64, Vec<i64>> = HashMap::new();
-        for i in 0..q_size {
-            let res = power(a, i as i64, n);
-            results_map.entry(res).or_default().push(i as i64);
+        // --- Начало ОПТИМИЗИРОВАННОЙ и корректной симуляции оракула ---
+
+        // 1. Эффективно группируем все входы 'x' по их результатам 'y = a^x mod n'.
+        //    Это позволяет избежать создания огромного промежуточного вектора.
+        let mut results_map: HashMap<i64, Vec<usize>> = HashMap::new();
+        for x in 0..q_size {
+            let y = power(a, x as i64, n);
+            results_map.entry(y).or_default().push(x);
         }
 
-        let measured_key_index = rng.gen_range(0..results_map.keys().len());
-        let measured_key = *results_map.keys().nth(measured_key_index).unwrap();
-        let measured_indices = results_map.get(&measured_key).unwrap();
+        // 2. Симулируем измерение, выбирая случайный ключ (результат 'y') из карты.
+        //    Это гарантирует, что мы выбираем только из реально возможных исходов.
+        let measured_y = *results_map.keys().choose(&mut rng)
+            .ok_or_else(|| "Не удалось выбрать результат из возможных".to_string())?;
 
+        // 3. Получаем список всех входов 'x', которые привели к измеренному 'y'.
+        let periodic_inputs = results_map.get(&measured_y).unwrap();
+
+        // 4. Создаем итоговое состояние суперпозиции.
+        let amplitude = Complex::new(1.0 / (periodic_inputs.len() as f64).sqrt(), 0.0);
         let mut state = vec![Complex::new(0.0, 0.0); q_size];
-        let amplitude = 1.0 / (measured_indices.len() as f64).sqrt();
-        for &idx in measured_indices {
-            state[idx as usize] = Complex::new(amplitude, 0.0);
+        for x in periodic_inputs {
+            state[*x] = amplitude;
         }
 
+        // --- Конец ОПТИМИЗИРОВАННОЙ симуляции ---
+
+        // Применение IQFT
         iqft(&mut state);
-        let measurement = measure(&state);
-
-        if measurement == 0 { continue; }
-
-        let phase = measurement as f64 / q_size as f64;
-        let r = continued_fractions(phase, n);
-
-        if r == 0 || r % 2 != 0 { continue; }
         
-        // Добавим проверку, чтобы избежать херни при вычитании
-        let base = power(a, r / 2, n);
-        if base == n - 1 { continue; }
+        // Измерение
+        let measurement = match measure(&state) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("Measurement error: {}", e);
+                continue;
+            }
+        };
 
-
-        let factor1 = gcd(base + 1, n);
-        let factor2 = gcd(base - 1, n);
-
-        if factor1 != 1 && factor1 != n {
-            println!("Factor found: {}", factor1);
-            return;
+        if measurement == 0 {
+            continue;
         }
-        if factor2 != 1 && factor2 != n {
-            println!("Factor found: {}", factor2);
-            return;
+
+        // Поиск периода через непрерывные дроби
+        let candidates = get_continued_fraction_denominators(measurement as i64, q_size as i64, n);
+
+        // Перебираем кандидатов в периоды.
+        // Логика здесь в том, чтобы использовать первого же "хорошего" кандидата.
+        // Если он не срабатывает, вся попытка с текущим 'a' считается неудачной.
+        for r in candidates {
+            if r == 0 || r % 2 != 0 {
+                continue;
+            }
+
+            let base = power(a, r / 2, n);
+            if base == n - 1 {
+                // Это известный случай неудачи для данного 'a'.
+                // Нет смысла проверять других кандидатов, переходим к следующей попытке.
+                continue 'attempt_loop;
+            }
+            if base == 1 {
+                // Это может означать, что r - четное кратное истинного периода.
+                // Попробуем следующего кандидата из списка.
+                continue;
+            }
+
+            // Найден нетривиальный множитель
+            let factor = gcd(base + 1, n);
+            if factor != 1 && factor != n {
+                return Ok(factor);
+            }
+            // Если мы дошли сюда, значит, этот кандидат не сработал.
+            // Прерываем цикл по кандидатам и переходим к следующей попытке с новым 'a'.
+            break;
         }
     }
+
+    Err("Failed to find factors after maximum attempts".to_string())
 }
 
 fn main() {
-    println!("Enter a number to factor (e.g., 15, 21):");
+    println!("Алгоритм Шора");
+    println!("Введите число для факторизации (добавьте флаг --force-quantum для пропуска классических проверок):");
+    
+    let args: Vec<String> = env::args().collect();
+    let force_quantum = args.contains(&"--force-quantum".to_string());
+    
     let mut input = String::new();
     io::stdin().read_line(&mut input).expect("Failed to read line");
 
     let n: i64 = match input.trim().parse() {
         Ok(num) => num,
         Err(_) => {
-            println!("Please enter a valid number.");
+            println!("Пожалуйста, введите корректное число.");
             return;
         }
     };
 
-    if n <= 1 {
-        println!("Please enter a number greater than 1.");
-        return;
+    match shors_algorithm(n, force_quantum) {
+        Ok(factor) => {
+            println!("Найден множитель: {}", factor);
+            println!("Проверка: {} = {} x {}", n, factor, n / factor);
+        }
+        Err(e) => {
+            println!("Ошибка: {}", e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_power() {
+        assert_eq!(power(2, 10, 1000), 24);
+        assert_eq!(power(3, 4, 5), 1);
+        assert_eq!(power(7, 3, 13), 5);
     }
 
-    shors_algorithm(n);
+    #[test]
+    fn test_gcd() {
+        assert_eq!(gcd(48, 18), 6);
+        assert_eq!(gcd(17, 13), 1);
+        assert_eq!(gcd(100, 75), 25);
+    }
+
+    #[test]
+    fn test_is_prime() {
+        assert!(is_prime(17, 5));
+        assert!(is_prime(97, 5));
+        assert!(!is_prime(15, 5));
+        assert!(!is_prime(91, 5));
+    }
+
+    #[test]
+    fn test_hadamard() {
+        let mut state = vec![
+            Complex::new(1.0, 0.0),
+            Complex::new(0.0, 0.0),
+        ];
+        hadamard(&mut state, 0);
+        
+        let expected_amp = std::f64::consts::FRAC_1_SQRT_2;
+        assert!((state[0].re - expected_amp).abs() < 1e-10);
+        assert!((state[1].re - expected_amp).abs() < 1e-10);
+    }
 }
