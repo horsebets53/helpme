@@ -17,7 +17,7 @@ type QuantumState = Vec<Complex<f64>>;
 /// Оптимизированное быстрое возведение в степень по модулю
 fn power(base: i64, exp: i64, modulus: i64) -> i64 {
     if modulus == 0 {
-        panic!("Modulus cannot be zero");
+        panic!("Модуль не может быть нулевым");
     }
     if modulus == 1 {
         return 0;
@@ -50,6 +50,34 @@ fn gcd(mut a: i64, mut b: i64) -> i64 {
     a
 }
 
+/// Вычисляет целочисленный квадратный корень с использованием метода Ньютона.
+/// # Аргументы
+/// * `n` - Неотрицательное целое число.
+/// # Возвращаемое значение
+/// `Result<i64, String>`, содержащий целочисленный квадратный корень или ошибку.
+fn integer_sqrt(n: i64) -> Result<i64, String> {
+    if n < 0 {
+        return Err("Отрицательное число не имеет реального квадратного корня.".to_string());
+    }
+    if n == 0 {
+        return Ok(0);
+    }
+
+    // Используем u128 для вычислений, чтобы избежать переполнения.
+    let n_u128 = n as u128;
+    let mut x = n_u128; // Начальное приближение.
+
+    loop {
+        let y = (x + n_u128 / x) / 2;
+        if y >= x {
+            // Сходимость достигнута. `x` гарантированно помещается в i64,
+            // так как sqrt(i64::MAX) помещается в i64.
+            return Ok(x as i64);
+        }
+        x = y;
+    }
+}
+
 /// Улучшенный тест простоты с детерминистическими проверками
 fn is_prime(n: i64, k: u32) -> bool {
     if n <= 1 {
@@ -64,13 +92,22 @@ fn is_prime(n: i64, k: u32) -> bool {
     
     // Проверка малых делителей до sqrt(n)
     if n < 1000 {
-        let sqrt_n = (n as f64).sqrt() as i64;
-        for i in (5..=sqrt_n).step_by(6) {
-            if n % i == 0 || n % (i + 2) == 0 {
+        match integer_sqrt(n) {
+            Ok(sqrt_n) => {
+                for i in (5..=sqrt_n).step_by(6) {
+                    if n % i == 0 || n % (i + 2) == 0 {
+                        return false;
+                    }
+                }
+                // Если делители не найдены, число простое.
+                return true;
+            }
+            Err(_) => {
+                // Ошибка вычисления корня означает, что что-то не так;
+                // безопаснее считать число не простым.
                 return false;
             }
         }
-        return true;
     }
     
     // Тест Миллера-Рабина для больших чисел
@@ -107,10 +144,16 @@ fn is_prime(n: i64, k: u32) -> bool {
 /// Оптимизированная и распараллеленная реализация вентиля Адамара.
 /// Эта версия исправляет логическую ошибку в предложенной "упрощённой" реализации,
 /// сохраняя при этом корректный блочный подход, который правильно работает для любого кубита.
+///
+/// # Примечание об эффективности
+///
+/// Использование `rayon` для распараллеливания может быть не всегда эффективно
+/// из-за накладных расходов на создание потоков, особенно на малых квантовых состояниях.
+/// Рекомендуется использовать профилирование для оценки реального ускорения.
 fn hadamard(state: &mut QuantumState, qubit: usize) {
     let n_qubits = (state.len() as f64).log2() as usize;
     if qubit >= n_qubits {
-        panic!("Qubit index out of bounds");
+        panic!("Индекс кубита за границами предела(hadamard)");
     }
 
     let sqrt2_inv = std::f64::consts::FRAC_1_SQRT_2;
@@ -137,7 +180,7 @@ fn hadamard(state: &mut QuantumState, qubit: usize) {
 fn phase_shift(state: &mut QuantumState, control: usize, target: usize, angle: f64) {
     let n_qubits = (state.len() as f64).log2() as usize;
     if control >= n_qubits || target >= n_qubits {
-        panic!("Qubit index out of bounds");
+        panic!("Индекс кубита за границами предела(phase_shift)");
     }
     
     let phase = Complex::new(angle.cos(), angle.sin());
@@ -162,10 +205,16 @@ fn iqft(state: &mut QuantumState) {
 
     // Bit reversal - этот шаг должен быть в НАЧАЛЕ для данной реализации IQFT.
     // Перестановка битов подготавливает состояние для каскада вентилей.
+    // Операция `swap` здесь безопасна, так как `reverse_bits` гарантирует,
+    // что `j` находится в пределах `0..state.len()`. Для дополнительной
+    // безопасности используется `split_at_mut`, чтобы избежать любых
+    // потенциальных проблем с заимствованием при обмене элементов.
     for i in 0..state.len() {
         let j = reverse_bits(i, n);
         if i < j {
-            state.swap(i, j);
+            // Безопасный обмен элементов с помощью `split_at_mut`
+            let (left, right) = state.split_at_mut(j);
+            std::mem::swap(&mut left[i], &mut right[0]);
         }
     }
     
@@ -299,11 +348,15 @@ fn shors_algorithm(n: i64, force_quantum: bool) -> Result<i64, String> {
     // проверяем, можем ли мы вообще запустить квантовую симуляцию.
     let n_bits = (n as f64).log2().ceil() as u32;
     let q_qubits = 2 * n_bits;
-    const MAX_SIMULATED_QUBITS: u32 = 26;
-    if q_qubits > MAX_SIMULATED_QUBITS {
+    let max_simulated_qubits: u32 = env::var("MAX_QUBITS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(26);
+
+    if q_qubits > max_simulated_qubits {
         return Err(format!(
             "Число {} требует {} кубитов для симуляции, что превышает лимит в {}. Классические проверки не нашли множителей.",
-            n, q_qubits, MAX_SIMULATED_QUBITS
+            n, q_qubits, max_simulated_qubits
         ));
     }
 
@@ -318,7 +371,7 @@ fn shors_algorithm(n: i64, force_quantum: bool) -> Result<i64, String> {
         }
 
         let q_size = 1 << q_qubits;
-        println!("Attempt {}: Using {} qubits, a = {}", attempt + 1, q_qubits, a);
+        println!("Попытка {}: используем {} qubits, a = {}", attempt + 1, q_qubits, a);
 
         // --- Начало ОПТИМИЗИРОВАННОЙ и корректной симуляции оракула ---
 
@@ -354,7 +407,7 @@ fn shors_algorithm(n: i64, force_quantum: bool) -> Result<i64, String> {
         let measurement = match measure(&state) {
             Ok(m) => m,
             Err(e) => {
-                println!("Measurement error: {}", e);
+                println!("Ошибка в измерении: {}", e);
                 continue;
             }
         };
@@ -397,7 +450,10 @@ fn shors_algorithm(n: i64, force_quantum: bool) -> Result<i64, String> {
         }
     }
 
-    Err("Failed to find factors after maximum attempts".to_string())
+    Err(format!(
+        "Не удалось найти множители для числа {} после {} попыток.",
+        n, max_attempts
+    ))
 }
 
 fn main() {
@@ -408,7 +464,13 @@ fn main() {
     let force_quantum = args.contains(&"--force-quantum".to_string());
     
     let mut input = String::new();
-    io::stdin().read_line(&mut input).expect("Failed to read line");
+    match io::stdin().read_line(&mut input) {
+        Ok(_) => {},
+        Err(e) => {
+            println!("Ошибка при чтении строки: {}", e);
+            return;
+        }
+    }
 
     let n: i64 = match input.trim().parse() {
         Ok(num) => num,
